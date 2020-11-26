@@ -1,12 +1,12 @@
 import abc
 import inspect
-from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Tuple, Type
 
 import numpy as np
 
 from pandas._config import option_context
 
-from pandas._typing import Axis
+from pandas._typing import Axis, FrameOrSeriesUnion
 from pandas.util._decorators import cache_readonly
 
 from pandas.core.dtypes.common import is_dict_like, is_list_like, is_sequence
@@ -15,7 +15,7 @@ from pandas.core.dtypes.generic import ABCSeries
 from pandas.core.construction import create_series_with_explicit_dtype
 
 if TYPE_CHECKING:
-    from pandas import DataFrame, Series, Index
+    from pandas import DataFrame, Index, Series
 
 ResType = Dict[int, Any]
 
@@ -26,7 +26,6 @@ def frame_apply(
     axis: Axis = 0,
     raw: bool = False,
     result_type: Optional[str] = None,
-    ignore_failures: bool = False,
     args=None,
     kwds=None,
 ):
@@ -43,7 +42,6 @@ def frame_apply(
         func,
         raw=raw,
         result_type=result_type,
-        ignore_failures=ignore_failures,
         args=args,
         kwds=kwds,
     )
@@ -73,7 +71,7 @@ class FrameApply(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def wrap_results_for_axis(
         self, results: ResType, res_index: "Index"
-    ) -> Union["Series", "DataFrame"]:
+    ) -> FrameOrSeriesUnion:
         pass
 
     # ---------------------------------------------------------------
@@ -84,13 +82,11 @@ class FrameApply(metaclass=abc.ABCMeta):
         func,
         raw: bool,
         result_type: Optional[str],
-        ignore_failures: bool,
         args,
         kwds,
     ):
         self.obj = obj
         self.raw = raw
-        self.ignore_failures = ignore_failures
         self.args = args or ()
         self.kwds = kwds or {}
 
@@ -141,7 +137,11 @@ class FrameApply(metaclass=abc.ABCMeta):
         """ compute the results """
         # dispatch to agg
         if is_list_like(self.f) or is_dict_like(self.f):
-            return self.obj.aggregate(self.f, axis=self.axis, *self.args, **self.kwds)
+            # pandas\core\apply.py:144: error: "aggregate" of "DataFrame" gets
+            # multiple values for keyword argument "axis"
+            return self.obj.aggregate(  # type: ignore[misc]
+                self.f, axis=self.axis, *self.args, **self.kwds
+            )
 
         # all empty
         if len(self.columns) == 0 and len(self.index) == 0:
@@ -216,7 +216,23 @@ class FrameApply(metaclass=abc.ABCMeta):
 
     def apply_raw(self):
         """ apply to the values as a numpy array """
-        result = np.apply_along_axis(self.f, self.axis, self.values)
+
+        def wrap_function(func):
+            """
+            Wrap user supplied function to work around numpy issue.
+
+            see https://github.com/numpy/numpy/issues/8352
+            """
+
+            def wrapper(*args, **kwargs):
+                result = func(*args, **kwargs)
+                if isinstance(result, str):
+                    result = np.array(result, dtype=object)
+                return result
+
+            return wrapper
+
+        result = np.apply_along_axis(wrap_function(self.f), self.axis, self.values)
 
         # TODO: mixed type case
         if result.ndim == 2:
@@ -252,51 +268,21 @@ class FrameApply(metaclass=abc.ABCMeta):
         return result
 
     def apply_standard(self):
-
-        # partial result that may be returned from reduction
-        partial_result = None
-
-        # compute the result using the series generator,
-        # use the result computed while trying to reduce if available.
-        results, res_index = self.apply_series_generator(partial_result)
+        results, res_index = self.apply_series_generator()
 
         # wrap results
         return self.wrap_results(results, res_index)
 
-    def apply_series_generator(self, partial_result=None) -> Tuple[ResType, "Index"]:
+    def apply_series_generator(self) -> Tuple[ResType, "Index"]:
         series_gen = self.series_generator
         res_index = self.result_index
 
         results = {}
 
-        # If a partial result was already computed,
-        # use it instead of running on the first element again
-        series_gen_enumeration = enumerate(series_gen)
-        if partial_result is not None:
-            i, v = next(series_gen_enumeration)
-            results[i] = partial_result
-
-        if self.ignore_failures:
-            successes = []
-            for i, v in series_gen_enumeration:
-                try:
-                    results[i] = self.f(v)
-                except Exception:
-                    pass
-                else:
-                    successes.append(i)
-
-            # so will work with MultiIndex
-            if len(successes) < len(res_index):
-                res_index = res_index.take(successes)
-
-        else:
-            for i, v in series_gen_enumeration:
-
-                with option_context("mode.chained_assignment", None):
-                    # ignore SettingWithCopy here in case the user mutates
-                    results[i] = self.f(v)
-
+        with option_context("mode.chained_assignment", None):
+            for i, v in enumerate(series_gen):
+                # ignore SettingWithCopy here in case the user mutates
+                results[i] = self.f(v)
                 if isinstance(results[i], ABCSeries):
                     # If we have a view on v, we need to make a copy because
                     #  series_generator will swap out the underlying data
@@ -304,9 +290,7 @@ class FrameApply(metaclass=abc.ABCMeta):
 
         return results, res_index
 
-    def wrap_results(
-        self, results: ResType, res_index: "Index"
-    ) -> Union["Series", "DataFrame"]:
+    def wrap_results(self, results: ResType, res_index: "Index") -> FrameOrSeriesUnion:
         from pandas import Series
 
         # see if we can infer the results
@@ -350,18 +334,23 @@ class FrameRowApply(FrameApply):
 
     def wrap_results_for_axis(
         self, results: ResType, res_index: "Index"
-    ) -> Union["Series", "DataFrame"]:
+    ) -> FrameOrSeriesUnion:
         """ return the results for the rows """
 
         if self.result_type == "reduce":
             # e.g. test_apply_dict GH#8735
-            return self.obj._constructor_sliced(results)
+            res = self.obj._constructor_sliced(results)
+            res.index = res_index
+            return res
+
         elif self.result_type is None and all(
             isinstance(x, dict) for x in results.values()
         ):
             # Our operation was a to_dict op e.g.
-            #  test_apply_dict GH#8735, test_apply_reduce_rows_to_dict GH#25196
-            return self.obj._constructor_sliced(results)
+            #  test_apply_dict GH#8735, test_apply_reduce_to_dict GH#25196 #37544
+            res = self.obj._constructor_sliced(results)
+            res.index = res_index
+            return res
 
         try:
             result = self.obj._constructor(data=results)
@@ -404,6 +393,8 @@ class FrameColumnApply(FrameApply):
         blk = mgr.blocks[0]
 
         for (arr, name) in zip(values, self.index):
+            # GH#35462 re-pin mgr in case setitem changed it
+            ser._mgr = mgr
             blk.values = arr
             ser.name = name
             yield ser
@@ -418,9 +409,9 @@ class FrameColumnApply(FrameApply):
 
     def wrap_results_for_axis(
         self, results: ResType, res_index: "Index"
-    ) -> Union["Series", "DataFrame"]:
+    ) -> FrameOrSeriesUnion:
         """ return the results for the columns """
-        result: Union["Series", "DataFrame"]
+        result: FrameOrSeriesUnion
 
         # we have requested to expand
         if self.result_type == "expand":

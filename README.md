@@ -32,7 +32,7 @@ its way towards this goal.
 Here are just a few of the things that pandas does well:
 
   - Easy handling of [**missing data**][missing-data] (represented as
-    `NaN`) in floating point as well as non-floating point data
+    `NaN`, `NA`, or `NaT`) in floating point as well as non-floating point data
   - Size mutability: columns can be [**inserted and
     deleted**][insertion-deletion] from DataFrame and higher dimensional
     objects
@@ -60,7 +60,7 @@ Here are just a few of the things that pandas does well:
     and saving/loading data from the ultrafast [**HDF5 format**][hdfstore]
   - [**Time series**][timeseries]-specific functionality: date range
     generation and frequency conversion, moving window statistics,
-    date shifting and lagging.
+    date shifting and lagging
 
 
    [missing-data]: https://pandas.pydata.org/pandas-docs/stable/missing_data.html#working-with-missing-data

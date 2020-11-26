@@ -9,56 +9,71 @@ shadows the python class, where we do any heavy lifting.
 import warnings
 
 import numpy as np
+
 cimport numpy as cnp
-from numpy cimport int64_t, int8_t, uint8_t, ndarray
+from numpy cimport int8_t, int64_t, ndarray, uint8_t
+
 cnp.import_array()
 
-from cpython.object cimport (PyObject_RichCompareBool, PyObject_RichCompare,
-                             Py_GT, Py_GE, Py_EQ, Py_NE, Py_LT, Py_LE)
-
-from cpython.datetime cimport (
-    datetime,
-    time,
-    tzinfo,
+from cpython.datetime cimport (  # alias bc `tzinfo` is a kwarg below
     PyDateTime_Check,
+    PyDateTime_IMPORT,
     PyDelta_Check,
     PyTZInfo_Check,
-    PyDateTime_IMPORT,
+    datetime,
+    time,
+    tzinfo as tzinfo_type,
 )
+from cpython.object cimport Py_EQ, Py_NE, PyObject_RichCompare, PyObject_RichCompareBool
+
 PyDateTime_IMPORT
 
-from pandas._libs.tslibs.util cimport (
-    is_datetime64_object, is_float_object, is_integer_object,
-    is_timedelta64_object, is_array,
-)
-
-from pandas._libs.tslibs.base cimport ABCTimestamp
-
 from pandas._libs.tslibs cimport ccalendar
-
+from pandas._libs.tslibs.base cimport ABCTimestamp
 from pandas._libs.tslibs.conversion cimport (
     _TSObject,
-    convert_to_tsobject,
     convert_datetime_to_tsobject,
+    convert_to_tsobject,
     normalize_i8_stamp,
 )
-from pandas._libs.tslibs.fields import get_start_end_field, get_date_name_field
+from pandas._libs.tslibs.util cimport (
+    is_array,
+    is_datetime64_object,
+    is_float_object,
+    is_integer_object,
+    is_timedelta64_object,
+)
+
+from pandas._libs.tslibs.fields import get_date_name_field, get_start_end_field
+
 from pandas._libs.tslibs.nattype cimport NPY_NAT, c_NaT as NaT
 from pandas._libs.tslibs.np_datetime cimport (
-    check_dts_bounds, npy_datetimestruct, dt64_to_dtstruct,
+    check_dts_bounds,
     cmp_scalar,
+    dt64_to_dtstruct,
+    npy_datetimestruct,
     pydatetime_to_dt64,
 )
+
 from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
-from pandas._libs.tslibs.offsets cimport to_offset, is_tick_object, is_offset_object
-from pandas._libs.tslibs.timedeltas cimport is_any_td_scalar, delta_to_nanoseconds
+
+from pandas._libs.tslibs.offsets cimport is_offset_object, to_offset
+from pandas._libs.tslibs.timedeltas cimport delta_to_nanoseconds, is_any_td_scalar
+
 from pandas._libs.tslibs.timedeltas import Timedelta
+
 from pandas._libs.tslibs.timezones cimport (
-    is_utc, maybe_get_tz, treat_tz_as_pytz, utc_pytz as UTC,
-    get_timezone, tz_compare,
+    get_timezone,
+    is_utc,
+    maybe_get_tz,
+    treat_tz_as_pytz,
+    tz_compare,
+    utc_pytz as UTC,
 )
-from pandas._libs.tslibs.tzconversion cimport tz_convert_single
-from pandas._libs.tslibs.tzconversion import tz_localize_to_utc
+from pandas._libs.tslibs.tzconversion cimport (
+    tz_convert_from_utc_single,
+    tz_localize_to_utc_single,
+)
 
 # ----------------------------------------------------------------------
 # Constants
@@ -215,6 +230,8 @@ cdef class _Timestamp(ABCTimestamp):
 
     # higher than np.ndarray and np.matrix
     __array_priority__ = 100
+    dayofweek = _Timestamp.day_of_week
+    dayofyear = _Timestamp.day_of_year
 
     def __hash__(_Timestamp self):
         if self.nanosecond:
@@ -245,6 +262,10 @@ cdef class _Timestamp(ABCTimestamp):
             if other.dtype.kind == "M":
                 if self.tz is None:
                     return PyObject_RichCompare(self.asm8, other, op)
+                elif op == Py_NE:
+                    return np.ones(other.shape, dtype=np.bool_)
+                elif op == Py_EQ:
+                    return np.zeros(other.shape, dtype=np.bool_)
                 raise TypeError(
                     "Cannot compare tz-naive and tz-aware timestamps"
                 )
@@ -263,7 +284,12 @@ cdef class _Timestamp(ABCTimestamp):
         else:
             return NotImplemented
 
-        self._assert_tzawareness_compat(ots)
+        if not self._can_compare(ots):
+            if op == Py_NE or op == Py_EQ:
+                return NotImplemented
+            raise TypeError(
+                "Cannot compare tz-naive and tz-aware timestamps"
+            )
         return cmp_scalar(self.value, ots.value, op)
 
     cdef bint _compare_outside_nanorange(_Timestamp self, datetime other,
@@ -271,16 +297,15 @@ cdef class _Timestamp(ABCTimestamp):
         cdef:
             datetime dtval = self.to_pydatetime()
 
-        self._assert_tzawareness_compat(other)
+        if not self._can_compare(other):
+            return NotImplemented
+
         return PyObject_RichCompareBool(dtval, other, op)
 
-    cdef _assert_tzawareness_compat(_Timestamp self, datetime other):
-        if self.tzinfo is None:
-            if other.tzinfo is not None:
-                raise TypeError('Cannot compare tz-naive and tz-aware '
-                                'timestamps')
-        elif other.tzinfo is None:
-            raise TypeError('Cannot compare tz-naive and tz-aware timestamps')
+    cdef bint _can_compare(self, datetime other):
+        if self.tzinfo is not None:
+            return other.tzinfo is not None
+        return other.tzinfo is None
 
     def __add__(self, other):
         cdef:
@@ -488,9 +513,7 @@ cdef class _Timestamp(ABCTimestamp):
 
         Returns
         -------
-        day_name : string
-
-        .. versionadded:: 0.23.0
+        str
         """
         return self._get_date_name_field("day_name", locale)
 
@@ -505,9 +528,7 @@ cdef class _Timestamp(ABCTimestamp):
 
         Returns
         -------
-        month_name : string
-
-        .. versionadded:: 0.23.0
+        str
         """
         return self._get_date_name_field("month_name", locale)
 
@@ -519,14 +540,14 @@ cdef class _Timestamp(ABCTimestamp):
         return bool(ccalendar.is_leapyear(self.year))
 
     @property
-    def dayofweek(self) -> int:
+    def day_of_week(self) -> int:
         """
         Return day of the week.
         """
         return self.weekday()
 
     @property
-    def dayofyear(self) -> int:
+    def day_of_year(self) -> int:
         """
         Return the day of the year.
         """
@@ -768,7 +789,6 @@ class Timestamp(_Timestamp):
     year, month, day : int
     hour, minute, second, microsecond : int, optional, default 0
     nanosecond : int, optional, default 0
-        .. versionadded:: 0.23.0
     tzinfo : datetime.tzinfo, optional, default None
     fold : {0, 1}, default None, keyword-only
         Due to daylight saving time, one wall clock time can occur twice
@@ -892,9 +912,25 @@ class Timestamp(_Timestamp):
         """
         Timestamp.fromtimestamp(ts)
 
-        timestamp[, tz] -> tz's local time from POSIX timestamp.
+        Transform timestamp[, tz] to tz's local time from POSIX timestamp.
         """
         return cls(datetime.fromtimestamp(ts))
+
+    def strftime(self, format):
+        """
+        Timestamp.strftime(format)
+
+        Return a string representing the given POSIX timestamp
+        controlled by an explicit format string.
+
+        Parameters
+        ----------
+        format : str
+            Format string to convert Timestamp to string.
+            See strftime documentation for more information on the format string:
+            https://docs.python.org/3/library/datetime.html#strftime-and-strptime-behavior.
+        """
+        return datetime.strftime(self, format)
 
     # Issue 25016.
     @classmethod
@@ -914,7 +950,7 @@ class Timestamp(_Timestamp):
         """
         Timestamp.combine(date, time)
 
-        date, time -> datetime with same date and time fields.
+        Combine date, time into datetime with same date and time fields.
         """
         return cls(datetime.combine(date, time))
 
@@ -932,7 +968,7 @@ class Timestamp(_Timestamp):
         second=None,
         microsecond=None,
         nanosecond=None,
-        tzinfo=None,
+        tzinfo_type tzinfo=None,
         *,
         fold=None
     ):
@@ -957,18 +993,17 @@ class Timestamp(_Timestamp):
         #
         # Mixing pydatetime positional and keyword arguments is forbidden!
 
-        cdef _TSObject ts
+        cdef:
+            _TSObject ts
+            tzinfo_type tzobj
 
         _date_attributes = [year, month, day, hour, minute, second,
                             microsecond, nanosecond]
 
         if tzinfo is not None:
-            if not PyTZInfo_Check(tzinfo):
-                # tzinfo must be a datetime.tzinfo object, GH#17690
-                raise TypeError(
-                    f"tzinfo must be a datetime.tzinfo object, not {type(tzinfo)}"
-                )
-            elif tz is not None:
+            # GH#17690 tzinfo must be a datetime.tzinfo object, ensured
+            #  by the cython annotation.
+            if tz is not None:
                 raise ValueError('Can provide at most one of tz, tzinfo')
 
             # User passed tzinfo instead of tz; avoid silently ignoring
@@ -1050,12 +1085,14 @@ class Timestamp(_Timestamp):
             nanosecond = hour
             tz = minute
             freq = None
+            unit = None
 
         if getattr(ts_input, 'tzinfo', None) is not None and tz is not None:
             raise ValueError("Cannot pass a datetime or Timestamp with tzinfo with "
                              "the tz parameter. Use tz_convert instead.")
 
-        ts = convert_to_tsobject(ts_input, tz, unit, 0, 0, nanosecond or 0)
+        tzobj = maybe_get_tz(tz)
+        ts = convert_to_tsobject(ts_input, tzobj, unit, 0, 0, nanosecond or 0)
 
         if ts.value == NPY_NAT:
             return NaT
@@ -1132,7 +1169,7 @@ timedelta}, default 'raise'
 
     def floor(self, freq, ambiguous='raise', nonexistent='raise'):
         """
-        return a new Timestamp floored to this resolution.
+        Return a new Timestamp floored to this resolution.
 
         Parameters
         ----------
@@ -1171,7 +1208,7 @@ timedelta}, default 'raise'
 
     def ceil(self, freq, ambiguous='raise', nonexistent='raise'):
         """
-        return a new Timestamp ceiled to this resolution.
+        Return a new Timestamp ceiled to this resolution.
 
         Parameters
         ----------
@@ -1298,14 +1335,14 @@ default 'raise'
             tz = maybe_get_tz(tz)
             if not isinstance(ambiguous, str):
                 ambiguous = [ambiguous]
-            value = tz_localize_to_utc(np.array([self.value], dtype='i8'), tz,
-                                       ambiguous=ambiguous,
-                                       nonexistent=nonexistent)[0]
+            value = tz_localize_to_utc_single(self.value, tz,
+                                              ambiguous=ambiguous,
+                                              nonexistent=nonexistent)
             return Timestamp(value, tz=tz, freq=self.freq)
         else:
             if tz is None:
                 # reset tz
-                value = tz_convert_single(self.value, UTC, self.tz)
+                value = tz_convert_from_utc_single(self.value, self.tz)
                 return Timestamp(value, tz=tz, freq=self.freq)
             else:
                 raise TypeError(
@@ -1353,10 +1390,10 @@ default 'raise'
         microsecond=None,
         nanosecond=None,
         tzinfo=object,
-        fold=0,
+        fold=None,
     ):
         """
-        implements datetime.replace, handles nanoseconds.
+        Implements datetime.replace, handles nanoseconds.
 
         Parameters
         ----------
@@ -1369,7 +1406,7 @@ default 'raise'
         microsecond : int, optional
         nanosecond : int, optional
         tzinfo : tz-convertible, optional
-        fold : int, optional, default is 0
+        fold : int, optional
 
         Returns
         -------
@@ -1378,16 +1415,21 @@ default 'raise'
 
         cdef:
             npy_datetimestruct dts
-            int64_t value, value_tz, offset
-            object _tzinfo, result, k, v
+            int64_t value
+            object k, v
             datetime ts_input
+            tzinfo_type tzobj
 
         # set to naive if needed
-        _tzinfo = self.tzinfo
+        tzobj = self.tzinfo
         value = self.value
-        if _tzinfo is not None:
-            value_tz = tz_convert_single(value, _tzinfo, UTC)
-            value += value - value_tz
+
+        # GH 37610. Preserve fold when replacing.
+        if fold is None:
+            fold = self.fold
+
+        if tzobj is not None:
+            value = tz_convert_from_utc_single(value, tzobj)
 
         # setup components
         dt64_to_dtstruct(value, &dts)
@@ -1419,30 +1461,30 @@ default 'raise'
         if nanosecond is not None:
             dts.ps = validate('nanosecond', nanosecond) * 1000
         if tzinfo is not object:
-            _tzinfo = tzinfo
+            tzobj = tzinfo
 
         # reconstruct & check bounds
-        if _tzinfo is not None and treat_tz_as_pytz(_tzinfo):
+        if tzobj is not None and treat_tz_as_pytz(tzobj):
             # replacing across a DST boundary may induce a new tzinfo object
             # see GH#18319
-            ts_input = _tzinfo.localize(datetime(dts.year, dts.month, dts.day,
-                                                 dts.hour, dts.min, dts.sec,
-                                                 dts.us),
-                                        is_dst=not bool(fold))
-            _tzinfo = ts_input.tzinfo
+            ts_input = tzobj.localize(datetime(dts.year, dts.month, dts.day,
+                                               dts.hour, dts.min, dts.sec,
+                                               dts.us),
+                                      is_dst=not bool(fold))
+            tzobj = ts_input.tzinfo
         else:
             kwargs = {'year': dts.year, 'month': dts.month, 'day': dts.day,
                       'hour': dts.hour, 'minute': dts.min, 'second': dts.sec,
-                      'microsecond': dts.us, 'tzinfo': _tzinfo,
+                      'microsecond': dts.us, 'tzinfo': tzobj,
                       'fold': fold}
             ts_input = datetime(**kwargs)
 
-        ts = convert_datetime_to_tsobject(ts_input, _tzinfo)
+        ts = convert_datetime_to_tsobject(ts_input, tzobj)
         value = ts.value + (dts.ps // 1000)
         if value != NPY_NAT:
             check_dts_bounds(&dts)
 
-        return create_timestamp_from_ts(value, dts, _tzinfo, self.freq, fold)
+        return create_timestamp_from_ts(value, dts, tzobj, self.freq, fold)
 
     def to_julian_date(self) -> np.float64:
         """
